@@ -1,5 +1,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
+use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunksMut, ParallelIterator};
 use core::iter::zip;
 
 use anyhow::{anyhow, Result};
@@ -282,6 +283,8 @@ pub trait Witness<F: Field>: WitnessWrite<F> {
 #[derive(Clone, Debug)]
 pub struct MatrixWitness<F: Field> {
     pub(crate) wire_values: Vec<Vec<F>>,
+    pub my_wire_values: Vec<F>,
+    pub degree: usize,
 }
 
 impl<F: Field> MatrixWitness<F> {
@@ -384,7 +387,20 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
             }
         }
 
-        MatrixWitness { wire_values }
+        MatrixWitness { wire_values, my_wire_values: vec![], degree: 0 }
+    }
+
+    pub fn my_full_witness(self) -> MatrixWitness<F> {
+        let mut my_wire_values = vec![F::ZERO; self.degree * self.num_wires];
+        my_wire_values.par_chunks_mut(self.degree).enumerate().for_each(|(j, values)| {
+            for i in 0..self.degree {
+                let t = Target::Wire(Wire { row: i, column: j });
+                if let Some(x) = self.try_get_target(t) {
+                    values[i] = x;
+                }
+            }
+        });
+        MatrixWitness {  wire_values: vec![], my_wire_values, degree: self.degree }
     }
 }
 

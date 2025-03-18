@@ -16,7 +16,7 @@
 
 extern crate core;
 
-use std::ffi::{c_char, c_ulong, c_void};
+use std::ffi::c_void;
 mod cuda {
     #[repr(C)]
     pub struct Error {

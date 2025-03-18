@@ -18,10 +18,12 @@ rand = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true, features = ["alloc"] }
 static_assertions = { workspace = true }
 unroll = { workspace = true }
+rustacuda = {workspace = true}
+rustacuda_core = {workspace = true}
 
 # Local dependencies
 plonky2_util = { version = "1.0.0", path = "../util", default-features = false }
-
+plonky2_cuda = { version = "1.0.0", path = "../cuda", default-features = false }
 
 # Display math equations properly in documentation
 [package.metadata.docs.rs]

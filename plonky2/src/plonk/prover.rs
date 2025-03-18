@@ -2,8 +2,12 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+use plonky2_cuda::DataSlice;
+use plonky2_util::log2_strict;
+use rustacuda::memory::{AsyncCopyDestination, DeviceSlice};
 use core::cmp::min;
-use core::mem::swap;
+use core::ffi::c_void;
+use core::mem::{swap, transmute};
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -14,7 +18,7 @@ use crate::field::extension::Extendable;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{CudaInnerContext, PolynomialBatch};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -809,4 +813,467 @@ fn compute_quotient_polys<
         .map(PolynomialValues::new)
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+pub fn prove_with_gpu<F: RichField + Extendable<D>, C: GenericConfig<D, F=F>, const D: usize>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    inputs: PartialWitness<F>,
+    timing: &mut TimingTree,
+    ctx: &mut crate::fri::oracle::CudaInvContext<F, C, D>,
+) -> Result<ProofWithPublicInputs<F, C, D>> {
+    let config = &common_data.config;
+    let num_challenges = config.num_challenges;
+    let quotient_degree = common_data.quotient_degree();
+    let degree = common_data.degree();
+
+    let partition_witness = timed!(
+        timing,
+        &format!("run {} generators", prover_data.generators.len()),
+        generate_partial_witness(inputs, prover_data, common_data)?
+    );
+
+    let (public_inputs_hash, public_inputs) = timed!(
+        timing,
+        "get public_inputs_hash",
+        {
+            let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
+            let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
+            (public_inputs_hash, public_inputs)
+        });
+
+    let mut witness = timed!(
+        timing,
+        "compute full witness",
+        partition_witness.my_full_witness()
+    );
+
+    let wires_values = &witness.my_wire_values;
+    // let wires_values: Vec<PolynomialValues<F>> = timed!(
+    //     timing,
+    //     "compute wire polynomials",
+    //     witness
+    //         .wire_values
+    //         .par_iter()
+    //         .map(|column| PolynomialValues::new(column.clone()))
+    //         .collect()
+    // );
+    assert!(wires_values.len() % degree == 0);
+
+    let wires_commitment = timed!(
+        timing,
+        "compute wires commitment",
+        PolynomialBatch::from_values_with_gpu(
+        // PolynomialBatch::from_values(
+            wires_values,
+            common_data.config.num_wires,
+            degree,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::WIRES.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+            ctx,
+        )
+    );
+    // sleep(time::Duration::from_secs(10000));
+    let mut challenger = Challenger::<F, C::Hasher>::new();
+
+    let (betas, gammas) = timed!(
+        timing,
+        "observe_hash for betas and gammas",
+        {
+            // Observe the instance.
+            challenger.observe_hash::<C::Hasher>(prover_data.circuit_digest);
+            challenger.observe_hash::<C::InnerHasher>(public_inputs_hash);
+
+            challenger.observe_cap(&wires_commitment.merkle_tree.cap);
+            let betas = challenger.get_n_challenges(num_challenges);
+            let gammas = challenger.get_n_challenges(num_challenges);
+            (betas, gammas)
+        });
+
+    assert!(
+        common_data.quotient_degree_factor < common_data.config.num_routed_wires,
+        "When the number of routed wires is smaller that the degree, we should change the logic to avoid computing partial products."
+    );
+    let mut partial_products_and_zs = timed!(
+        timing,
+        "compute partial products",
+        all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
+    );
+
+    // let zs_partial_products = timed!(
+    //     timing,
+    //     "get zs_partial_products",
+    //     {
+    //         // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
+    //         let plonk_z_vecs = partial_products_and_zs
+    //             .iter_mut()
+    //             .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
+    //             .collect();
+    //         let zs_partial_products =
+    //             [plonk_z_vecs, partial_products_and_zs.concat()].concat().into_iter().flat_map(|v| v.values).collect::<Vec<_>>();
+    //         zs_partial_products
+    //     });
+    // let zs_partial_products = &zs_partial_products;
+    //
+    // unsafe {
+    //     let v = zs_partial_products;
+    //     let mut file = File::create("zs_partial_products-new.bin").unwrap();
+    //     file.write_all(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()*8));
+    // }
+    // exit(0);
+
+    // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
+    let plonk_z_vecs = partial_products_and_zs
+        .iter_mut()
+        .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
+        .collect();
+    let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+    println!("zs_partial_products len:{}, itemLen:{}", zs_partial_products.len(), zs_partial_products[0].values.len());
+
+
+    // unsafe {
+    //     let v = zs_partial_products.iter().flat_map(|p|p.values.to_vec()).collect::<Vec<_>>();
+    //     let mut file = File::create("zs_partial_products-old.bin").unwrap();
+    //     file.write_all(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()*8));
+    // }
+
+    let zs_partial_products = &zs_partial_products.iter().flat_map(|p|p.values.to_vec()).collect::<Vec<_>>();
+    let partial_products_and_zs_commitment = timed!(
+        timing,
+        "commit to partial products and Z's",
+        // PolynomialBatch::from_values(
+        PolynomialBatch::from_values_with_gpu(
+            zs_partial_products,
+            zs_partial_products.len()/degree,
+            degree,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+            ctx,
+        )
+    );
+
+
+    // let partial_products_and_zs_commitment = timed!(
+    //     timing,
+    //     "commit to partial products and Z's",
+    //     PolynomialBatch::from_values(
+    //     // PolynomialBatch::from_values_with_gpu(
+    //         zs_partial_products,
+    //         // zs_partial_products.len()/degree,
+    //         // degree,
+    //         config.fri_config.rate_bits,
+    //         config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+    //         config.fri_config.cap_height,
+    //         timing,
+    //         prover_data.fft_root_table.as_ref(),
+    //         // &prover_data.fft_root_table_deg,
+    //         // ctx,
+    //     )
+    // );
+
+    let alphas = timed!(
+        timing,
+        "observe_cap for alphas",
+        {
+            challenger.observe_cap(&partial_products_and_zs_commitment.merkle_tree.cap);
+
+            let alphas = challenger.get_n_challenges(num_challenges);
+            alphas
+        });
+
+    // let quotient_polys = timed!(
+    //     timing,
+    //     "compute quotient polys",
+    //     compute_quotient_polys(
+    //         common_data,
+    //         prover_data,
+    //         &public_inputs_hash,
+    //         &wires_commitment,
+    //         &partial_products_and_zs_commitment,
+    //         &betas,
+    //         &gammas,
+    //         &alphas,
+    //         timing,
+    //     )
+    // );
+
+    timed!(
+        timing,
+        "compute quotient polys",
+        {
+            let poly_num = common_data.config.num_wires;
+            let values_num_per_poly = degree;
+            let lg_n = log2_strict(values_num_per_poly );
+            let values_flatten_len = poly_num*values_num_per_poly;
+
+            let rate_bits = config.fri_config.rate_bits;
+            let blinding = config.zero_knowledge && PlonkOracle::WIRES.blinding;
+            let salt_size = if blinding { 4 } else { 0 };
+
+            let ext_values_flatten_len = (values_flatten_len+salt_size*values_num_per_poly) * (1<<rate_bits);
+            let pad_extvalues_len = ext_values_flatten_len;
+            let values_num_per_extpoly = values_num_per_poly*(1<<rate_bits);
+
+            let (ext_values_device, remained) = ctx.cache_mem_device.split_at_mut(ctx.second_stage_offset);
+            // let (_, ext_values_device) = front_msm.split_at(values_flatten_len);
+            let root_table_device2 = &mut ctx.root_table_device2;
+            let shift_inv_powers_device = &mut ctx.shift_inv_powers_device;
+
+
+            let (partial_products_and_zs_commitment_leaves_device, alphas_device, betas_device, gammas_device,
+                d_outs, d_quotient_polys) = timed!(
+                timing,
+                "copy params",
+                {
+                    let mut useCnt = 0;
+                    // let partial_products_and_zs_commitment_leaves = if partial_products_and_zs_commitment.merkle_tree.my_leaves.is_empty() {
+                    //     partial_products_and_zs_commitment.merkle_tree.leaves.concat()
+                    // } else {
+                    //     partial_products_and_zs_commitment.merkle_tree.my_leaves.to_vec()
+                    // };
+                    // // unsafe
+                    // // {
+                    // //     let mut file = File::create("partial_products_and_zs_commitment_leaves.bin").unwrap();
+                    // //     file.write_all(std::slice::from_raw_parts(partial_products_and_zs_commitment_leaves.as_ptr() as *const u8, partial_products_and_zs_commitment_leaves.len()*8));
+                    // // }
+                    //
+                    // useCnt = partial_products_and_zs_commitment_leaves.len();
+
+                    // let (_, remained) = remained.split_at_mut(ctx.values_flatten2.len());
+
+                    useCnt = zs_partial_products.len() << rate_bits;
+                    let (data, remained) = remained.split_at_mut(useCnt);
+
+                    let partial_products_and_zs_commitment_leaves_device =
+                        DataSlice{ptr: data.as_ptr() as *const c_void, len: useCnt as i32 };
+                    // unsafe {
+                    //     transmute::<&mut DeviceSlice<F>, &mut DeviceSlice<u64>>(data).async_copy_from(
+                    //         transmute::<&Vec<F>, &Vec<u64>>(&partial_products_and_zs_commitment_leaves),
+                    //         &ctx.inner.stream
+                    //     ).unwrap();
+                    // }
+
+                    useCnt = values_num_per_extpoly*2;
+                    let (d_quotient_polys, remained) = remained.split_at_mut(useCnt);
+
+                    useCnt = values_num_per_extpoly*2;
+                    let (d_outs, remained) = remained.split_at_mut(useCnt);
+
+                    useCnt = num_challenges;
+                    let (d_alphas, remained) = remained.split_at_mut(useCnt);
+                    unsafe {
+                        transmute::<&mut DeviceSlice<F>, &mut DeviceSlice<u64>>(d_alphas).async_copy_from(
+                            transmute::<&Vec<F>, &Vec<u64>>(&alphas),
+                            &ctx.inner.stream
+                        ).unwrap();
+                    }
+                    let alphas_device = DataSlice{ptr: d_alphas.as_ptr() as *const c_void, len: alphas.len() as i32 };
+
+                    let (d_betas, remained) = remained.split_at_mut(useCnt);
+                    unsafe {
+                        transmute::<&mut DeviceSlice<F>, &mut DeviceSlice<u64>>(d_betas).async_copy_from(
+                            transmute::<&Vec<F>, &Vec<u64>>(&betas),
+                            &ctx.inner.stream
+                        ).unwrap();
+                    }
+                    let betas_device = DataSlice{ptr: d_betas.as_ptr() as *const c_void, len: betas.len() as i32 };
+
+                    let (d_gammas, remained) = remained.split_at_mut(useCnt);
+                    unsafe {
+                        transmute::<&mut DeviceSlice<F>, &mut DeviceSlice<u64>>(d_gammas).async_copy_from(
+                            transmute::<&Vec<F>, &Vec<u64>>(&gammas),
+                            &ctx.inner.stream
+                        ).unwrap();
+                    }
+                    let gammas_device = DataSlice{ptr: d_gammas.as_ptr() as *const c_void, len: gammas.len() as i32 };
+
+                    ctx.inner.stream.synchronize().unwrap();
+
+                    (partial_products_and_zs_commitment_leaves_device, alphas_device, betas_device, gammas_device, d_outs, d_quotient_polys)
+                }
+            );
+
+            let points_device = DataSlice{ptr: ctx.points_device.as_ptr() as *const c_void, len: ctx.points_device.len() as i32 };
+            let z_h_on_coset_evals_device = DataSlice{ptr: ctx.z_h_on_coset_evals_device.as_ptr() as *const c_void, len: ctx.z_h_on_coset_evals_device.len() as i32 };
+            let z_h_on_coset_inverses_device = DataSlice{ptr: ctx.z_h_on_coset_inverses_device.as_ptr() as *const c_void, len: ctx.z_h_on_coset_inverses_device.len() as i32 };
+            let k_is_device = DataSlice{ptr: ctx.k_is_device.as_ptr() as *const c_void, len: ctx.k_is_device.len() as i32 };
+
+            let constants_sigmas_commitment_leaves_device = DataSlice{
+                ptr: ctx.constants_sigmas_commitment_leaves_device.as_ptr() as *const c_void,
+                len: ctx.constants_sigmas_commitment_leaves_device.len() as i32,
+            };
+            let ctx_ptr :*mut CudaInnerContext = &mut ctx.inner;
+            timed!(
+                timing,
+                "compute quotient polys with GPU",
+                unsafe {
+                    plonky2_cuda::compute_quotient_polys(
+                        ext_values_device.as_ptr() as *const u64,
+
+                        poly_num as i32,
+                        values_num_per_poly as i32,
+                        lg_n as i32,
+                        root_table_device2.as_ptr() as *const u64,
+                        shift_inv_powers_device.as_ptr() as *const u64,
+                        rate_bits as i32,
+                        salt_size as i32,
+
+                        &partial_products_and_zs_commitment_leaves_device,
+                        &constants_sigmas_commitment_leaves_device,
+
+                        d_outs.as_mut_ptr() as *mut c_void,
+                        d_quotient_polys.as_mut_ptr() as *mut c_void,
+
+                        &points_device,
+                        &z_h_on_coset_evals_device,
+                        &z_h_on_coset_inverses_device,
+                        &k_is_device,
+
+                        &alphas_device,
+                        &betas_device,
+                        &gammas_device,
+
+                        ctx_ptr as *mut core::ffi::c_void,
+                    )
+                }
+            );
+            // let mut quotient_polys_flatten :Vec<F> = vec![F::ZERO; values_num_per_extpoly*2];
+            // timed!(
+            //         timing,
+            //         "copy result",
+            //         {
+            //             unsafe {
+            //                 transmute::<&DeviceSlice<F>, &DeviceSlice<u64>>(d_quotient_polys).async_copy_to(
+            //                 transmute::<&mut Vec<F>, &mut Vec<u64>>(&mut quotient_polys_flatten),
+            //                 &ctx.inner.stream).unwrap();
+            //                 ctx.inner.stream.synchronize().unwrap();
+            //             }
+            //         }
+            //     );
+            //
+            // (quotient_polys_flatten.chunks(values_num_per_extpoly).map(|c|PolynomialCoeffs{coeffs: c.to_vec()}).collect::<Vec<_>>(), d_quotient_polys)
+        });
+
+    // // Compute the quotient polynomials, aka `t` in the Plonk paper.
+    // let all_quotient_poly_chunks :Vec<PolynomialCoeffs<F>> = timed!(
+    //     timing,
+    //     "split up quotient polys",
+    //     quotient_polys
+    //         .into_par_iter()
+    //         .flat_map(|mut quotient_poly| {
+    //             quotient_poly.trim_to_len(quotient_degree).expect(
+    //                 "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+    //             );
+    //             // Split quotient into degree-n chunks.
+    //             quotient_poly.chunks(degree)
+    //         })
+    //         .collect()
+    // );
+    // println!("all_quotient_poly_chunks len:{}, itemLen:{}", all_quotient_poly_chunks.len(), all_quotient_poly_chunks[0].coeffs.len());
+
+    assert!(quotient_degree == (degree << config.fri_config.rate_bits));
+    // let quotient_polys_commitment = timed!(
+    //     timing,
+    //     "commit to quotient polys",
+    //     PolynomialBatch::from_coeffs(
+    //         all_quotient_poly_chunks,
+    //         config.fri_config.rate_bits,
+    //         config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+    //         config.fri_config.cap_height,
+    //         timing,
+    //         prover_data.fft_root_table.as_ref(),
+    //     )
+    // );
+
+    println!("offset: {}, values: {}, zs product: {}",
+             ctx.second_stage_offset, ctx.values_flatten2.len(), zs_partial_products.len()<<config.fri_config.rate_bits);
+    let quotient_polys_commitment = timed!(
+        timing,
+        "commit to quotient polys",
+        PolynomialBatch::from_coeffs_with_gpu(
+            ctx.second_stage_offset+(zs_partial_products.len()<<config.fri_config.rate_bits),
+            degree,
+            num_challenges*(1 << config.fri_config.rate_bits),
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+            config.fri_config.cap_height,
+            timing,
+            ctx,
+        )
+    );
+
+    let (zeta, g) = timed!(
+        timing,
+        "get zeta and g",
+        {
+            challenger.observe_cap(&quotient_polys_commitment.merkle_tree.cap);
+
+            let zeta = challenger.get_extension_challenge::<D>();
+            // To avoid leaking witness data, we want to ensure that our opening locations, `zeta` and
+            // `g * zeta`, are not in our subgroup `H`. It suffices to check `zeta` only, since
+            // `(g * zeta)^n = zeta^n`, where `n` is the order of `g`.
+            let g = F::Extension::primitive_root_of_unity(common_data.degree_bits());
+            ensure!(
+                zeta.exp_power_of_2(common_data.degree_bits()) != F::Extension::ONE,
+                "Opening point is in the subgroup."
+            );
+                    (zeta, g)
+        });
+    let openings = timed!(
+        timing,
+        "construct the opening set",
+        OpeningSet::new(
+            zeta,
+            g,
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &partial_products_and_zs_commitment,
+            &quotient_polys_commitment,
+            common_data,
+        )
+    );
+
+    timed!(
+        timing,
+        "observe_openings",
+            challenger.observe_openings(&openings.to_fri_openings())
+        );
+
+    let opening_proof = timed!(
+        timing,
+        "compute opening proofs",
+        PolynomialBatch::prove_openings_with_gpu(
+            &common_data.get_fri_instance(zeta),
+            &[
+                &prover_data.constants_sigmas_commitment,
+                &wires_commitment,
+                &partial_products_and_zs_commitment,
+                &quotient_polys_commitment,
+            ],
+            &mut challenger,
+            &common_data.fri_params,
+            None,
+            None,
+            timing,
+            &mut Some(ctx),
+        )
+    );
+
+    let proof = Proof {
+        wires_cap: wires_commitment.merkle_tree.cap,
+        plonk_zs_partial_products_cap: partial_products_and_zs_commitment.merkle_tree.cap,
+        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        openings,
+        opening_proof,
+    };
+    Ok(ProofWithPublicInputs {
+        proof,
+        public_inputs,
+    })
 }

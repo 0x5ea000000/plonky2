@@ -14,11 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
 
-use std::{env, path::PathBuf};
+use std::env;
 
 fn main() {
-
-    // Detect if there is CUDA compiler and engage "cuda" feature accordingly
     let nvcc = match env::var("NVCC") {
         Ok(var) => which::which(var),
         Err(_) => which::which("nvcc"),

@@ -9,6 +9,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use log::{debug, info, warn, Level};
+use plonky2_field::polynomial::PolynomialCoeffs;
+use plonky2_maybe_rayon::{MaybeParChunks, ParallelIterator};
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
@@ -33,7 +35,7 @@ use crate::gates::public_input::PublicInputGate;
 use crate::gates::selectors::{selector_ends_lookups, selector_polynomials, selectors_lookup};
 use crate::hash::hash_types::{HashOut, HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_proofs::MerkleProofTarget;
-use crate::hash::merkle_tree::MerkleCap;
+use crate::hash::merkle_tree::{MerkleCap, MerkleTree};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::{
     ConstantGenerator, CopyGenerator, RandomValueGenerator, SimpleGenerator, WitnessGeneratorRef,
@@ -1344,5 +1346,368 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
+    pub fn build_with_gpu<C: GenericConfig<D, F = F>>(mut self) -> CircuitData<F, C, D> {
+        let mut timing = TimingTree::new("preprocess", Level::Trace);
+        #[cfg(feature = "std")]
+        let start = Instant::now();
+        let rate_bits = self.config.fri_config.rate_bits;
+        let cap_height = self.config.fri_config.cap_height;
+
+        let num_luts = self.get_luts_length();
+        // Hash the public inputs, and route them to a `PublicInputGate` which will enforce that
+        // those hash wires match the claimed public inputs.
+        let num_public_inputs = self.public_inputs.len();
+        let public_inputs_hash =
+            self.hash_n_to_hash_no_pad::<C::InnerHasher>(self.public_inputs.clone());
+        let pi_gate = self.add_gate(PublicInputGate, vec![]);
+        for (&hash_part, wire) in public_inputs_hash
+            .elements
+            .iter()
+            .zip(PublicInputGate::wires_public_inputs_hash())
+        {
+            self.connect(hash_part, Target::wire(pi_gate, wire))
+        }
+        self.randomize_unused_pi_wires(pi_gate);
+
+        // Make sure we have enough constant generators. If not, add a `ConstantGate`.
+        while self.constants_to_targets.len() > self.constant_generators.len() {
+            self.add_gate(
+                ConstantGate {
+                    num_consts: self.config.num_constants,
+                },
+                vec![],
+            );
+        }
+
+        // For each constant-target pair used in the circuit, use a constant generator to fill this target.
+        for ((c, t), mut const_gen) in self
+            .constants_to_targets
+            .clone()
+            .into_iter()
+            // We need to enumerate constants_to_targets in some deterministic order to ensure that
+            // building a circuit is deterministic.
+            .sorted_by_key(|(c, _t)| c.to_canonical_u64())
+            .zip(self.constant_generators.clone())
+        {
+            // Set the constant in the constant polynomial.
+            self.gate_instances[const_gen.row].constants[const_gen.constant_index] = c;
+            // Generate a copy between the target and the routable wire.
+            self.connect(Target::wire(const_gen.row, const_gen.wire_index), t);
+            // Set the constant in the generator (it's initially set with a dummy value).
+            const_gen.set_constant(c);
+            self.add_simple_generator(const_gen);
+        }
+
+        info!(
+            "Degree before blinding & padding: {}",
+            self.gate_instances.len()
+        );
+        self.blind_and_pad();
+        let degree = self.gate_instances.len();
+        info!("Degree after blinding & padding: {}", degree);
+        let degree_bits = log2_strict(degree);
+        let fri_params = self.fri_params(degree_bits);
+        assert!(
+            fri_params.total_arities() <= degree_bits + rate_bits - cap_height,
+            "FRI total reduction arity is too large.",
+        );
+
+        let quotient_degree_factor = self.config.max_quotient_degree_factor;
+        let mut gates = self.gates.iter().cloned().collect::<Vec<_>>();
+        // Gates need to be sorted by their degrees (and ID to make the ordering deterministic) to compute the selector polynomials.
+        gates.sort_unstable_by_key(|g| (g.0.degree(), g.0.id()));
+        let (mut constant_vecs, selectors_info) =
+            selector_polynomials(&gates, &self.gate_instances, quotient_degree_factor + 1);
+        // constant_vecs.extend(self.constant_polys());
+        // let num_constants = constant_vecs.len();
+        // println!("num_constants: {}", num_constants);
+
+        // Get the lookup selectors.
+        let num_lookup_selectors = if num_luts != 0 {
+            let selector_lookups =
+                selectors_lookup(&gates, &self.gate_instances, &self.lookup_rows);
+            let selector_ends = selector_ends_lookups(&self.lookup_rows, &self.gate_instances);
+            let all_lookup_selectors = [selector_lookups, selector_ends].concat();
+            let num_lookup_selectors = all_lookup_selectors.len();
+            constant_vecs.extend(all_lookup_selectors);
+            num_lookup_selectors
+        } else {
+            0
+        };
+
+        let num_constants = 8;
+
+        let subgroup = F::two_adic_subgroup(degree_bits);
+
+        let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
+        // let (sigma_vecs, forest) = timed!(
+        //     timing,
+        //     "generate sigma polynomials",
+        //     self.sigma_vecs(&k_is, &subgroup, &mut timing)
+        // );
+
+        // Precompute FFT roots.
+        let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
+        let fft_root_table_max = fft_root_table(max_fft_points);
+
+        // let constants_sigmas_vecs = [constant_vecs, sigma_vecs.clone()].concat();
+        // let constants_sigmas_commitment = timed!(
+        //     timing,
+        //     "compute constants_sigmas_commitment",
+        //     PolynomialBatch::from_values(
+        //         constants_sigmas_vecs,
+        //         rate_bits,
+        //         PlonkOracle::CONSTANTS_SIGMAS.blinding,
+        //         cap_height,
+        //         &mut timing,
+        //         Some(&fft_root_table_max),
+        //     ));
+
+        // if false
+        // {
+        //     unsafe {
+        //         let sigma_vec_vallen = sigma_vecs[0].values.len();
+        //         let coeffs_vallen = constants_sigmas_commitment.polynomials[0].coeffs.len();
+        //         let leaves_vallen = constants_sigmas_commitment.merkle_tree.leaves[0].len();
+        //         let digests_len = constants_sigmas_commitment.merkle_tree.digests.len();
+        //         let caps_len = constants_sigmas_commitment.merkle_tree.cap.0.len();
+        //
+        //         println!("sigma_vec_vallen: {}, coeffs_vallen: {}, leaves_vallen: {}, digests_len: {}, caps_len: {}",
+        //                  sigma_vec_vallen, coeffs_vallen, leaves_vallen, digests_len, caps_len);
+        //
+        //         println!("num_wires: {}, num_routed_wires: {}, degree: {}", forest.num_wires, forest.num_routed_wires, forest.degree);
+        //         let mut file = File::create("forest.bin").unwrap();
+        //         file.write_all(std::slice::from_raw_parts(forest.parents.as_ptr() as *const u8, forest.parents.len()*8));
+        //
+        //         let mut file = File::create("sigma_vecs.bin").unwrap();
+        //         let v = sigma_vecs.iter().flat_map(|v| v.values.clone()).collect::<Vec<_>>();
+        //         file.write_all(std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()*8));
+        //
+        //         exit(0);
+        //
+        //         let mut file = File::create("constants_sigmas_commitment.polynomials.bin").unwrap();
+        //         for value in constants_sigmas_commitment.polynomials.iter().flat_map(|v| v.coeffs.clone()) {
+        //             file.write_all(std::mem::transmute::<&F, &[u8; 8]>(&value)).unwrap();
+        //         }
+        //         let mut file = File::create("constants_sigmas_commitment.leaves.bin").unwrap();
+        //         for value in constants_sigmas_commitment.merkle_tree.leaves.concat() {
+        //             file.write_all(std::mem::transmute::<&F, &[u8; 8]>(&value)).unwrap();
+        //         }
+        //         let mut file = File::create("constants_sigmas_commitment.digests.bin").unwrap();
+        //         for value in constants_sigmas_commitment.merkle_tree.digests {
+        //             file.write_all(std::mem::transmute::<&_, &[u8; 32]>(&value)).unwrap();
+        //         }
+        //         let mut file = File::create("constants_sigmas_commitment.caps.bin").unwrap();
+        //         for value in constants_sigmas_commitment.merkle_tree.cap.0 {
+        //             file.write_all(std::mem::transmute::<&_, &[u8; 32]>(&value)).unwrap();
+        //         }
+        //         exit(0);
+        //     }
+        // }
+
+        let (sigma_vecs, constants_sigmas_commitment, forest) = unsafe {
+            let sigma_vec_vallen = 262144;
+            let coeffs_vallen = 262144;
+            let leaves_vallen = 88;
+            let digests_len = 4194272;
+            let caps_len = 16;
+
+            // let sigma_vecs: Vec<PolynomialValues<F>> =
+            let sigmas = std::fs::read("sigma_vecs.bin").unwrap();
+            let sigmas_slice =
+                std::slice::from_raw_parts(sigmas.as_ptr() as *const F, sigmas.len() / 8);
+            let sigma_vecs = sigmas_slice
+                .par_chunks_exact(sigma_vec_vallen)
+                .map(|chunk| PolynomialValues {
+                    values: chunk.to_vec(),
+                })
+                .collect::<Vec<_>>();
+
+            let polynomials = std::fs::read("constants_sigmas_commitment.polynomials.bin").unwrap();
+            let polynomials_slice =
+                std::slice::from_raw_parts(polynomials.as_ptr() as *const F, polynomials.len() / 8);
+            let polynomials_vec = polynomials_slice
+                .par_chunks_exact(coeffs_vallen)
+                .map(|chunk| PolynomialCoeffs {
+                    coeffs: chunk.to_vec(),
+                })
+                .collect::<Vec<_>>();
+
+            let leaves = std::fs::read("constants_sigmas_commitment.leaves.bin").unwrap();
+            let leaves_slice =
+                std::slice::from_raw_parts(leaves.as_ptr() as *const F, leaves.len() / 8);
+            let leaves_vec = leaves_slice
+                .par_chunks_exact(leaves_vallen)
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>();
+            let digests = std::fs::read("constants_sigmas_commitment.digests.bin").unwrap();
+            let digests_slice = std::slice::from_raw_parts(
+                digests.as_ptr() as *const <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash,
+                digests.len() / 32,
+            );
+            let digests_vec = digests_slice.to_vec();
+            // let digests_vec = std::mem::transmute::<Vec<_>, Vec<GenericHashOut<F>>>(digests_vec);
+            assert!(digests_vec.len() == digests_len);
+
+            let caps = std::fs::read("constants_sigmas_commitment.caps.bin").unwrap();
+            let caps_slice = std::slice::from_raw_parts(
+                caps.as_ptr() as *const <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash,
+                caps.len() / 32,
+            );
+            let caps_vec = caps_slice.to_vec();
+            assert!(caps_vec.len() == caps_len);
+
+            let forest = std::fs::read("forest.bin").unwrap();
+            let forest_slice =
+                std::slice::from_raw_parts(forest.as_ptr() as *const usize, forest.len() / 8);
+            let forest_vec = forest_slice.to_vec();
+            let config = &self.config;
+            let mut forest = Forest::new(
+                config.num_wires,
+                config.num_routed_wires,
+                degree,
+                self.virtual_target_index,
+            );
+            forest.parents = forest_vec;
+
+            let constants_sigmas_commitment = PolynomialBatch {
+                polynomials: polynomials_vec,
+                merkle_tree: MerkleTree {
+                    leaves: leaves_vec,
+                    digests: digests_vec,
+                    cap: MerkleCap(caps_vec),
+                    my_leaf_len: 0,
+                    my_leaves: Arc::new(vec![]),
+                    my_leaves_len: 0,
+                    my_leaves_dev_offset: -1,
+                    my_digests: Arc::new(vec![]),
+                },
+                degree_log: degree_bits,
+                rate_bits,
+                blinding: PlonkOracle::CONSTANTS_SIGMAS.blinding,
+            };
+            (sigma_vecs, constants_sigmas_commitment, forest)
+        };
+
+        // Map between gates where not all generators are used and the gate's number of used generators.
+        let incomplete_gates = self
+            .current_slots
+            .values()
+            .flat_map(|current_slot| current_slot.current_slot.values().copied())
+            .collect::<HashMap<_, _>>();
+
+        // Add gate generators.
+        self.add_generators(
+            self.gate_instances
+                .iter()
+                .enumerate()
+                .flat_map(|(index, gate)| {
+                    let mut gens = gate.gate_ref.0.generators(index, &gate.constants);
+                    // Remove unused generators, if any.
+                    if let Some(&op) = incomplete_gates.get(&index) {
+                        gens.drain(op..);
+                    }
+                    gens
+                })
+                .collect(),
+        );
+
+        // Index generator indices by their watched targets.
+        let mut generator_indices_by_watches = BTreeMap::new();
+        for (i, generator) in self.generators.iter().enumerate() {
+            for watch in generator.0.watch_list() {
+                let watch_index = forest.target_index(watch);
+                let watch_rep_index = forest.parents[watch_index];
+                generator_indices_by_watches
+                    .entry(watch_rep_index)
+                    .or_insert_with(Vec::new)
+                    .push(i);
+            }
+        }
+        for indices in generator_indices_by_watches.values_mut() {
+            indices.dedup();
+            indices.shrink_to_fit();
+        }
+
+        let num_gate_constraints = gates
+            .iter()
+            .map(|gate| gate.0.num_constraints())
+            .max()
+            .expect("No gates?");
+
+        let num_partial_products =
+            num_partial_products(self.config.num_routed_wires, quotient_degree_factor);
+
+        let lookup_degree = self.config.max_quotient_degree_factor - 1;
+        let num_lookup_polys = if num_luts == 0 {
+            0
+        } else {
+            // There is 1 RE polynomial and multiple Sum/LDC polynomials.
+            LookupGate::num_slots(&self.config).div_ceil(lookup_degree) + 1
+        };
+
+        let constants_sigmas_cap = constants_sigmas_commitment.merkle_tree.cap.clone();
+        let domain_separator = self.domain_separator.unwrap_or_default();
+        let domain_separator_digest = C::Hasher::hash_pad(&domain_separator);
+        // TODO: This should also include an encoding of gate constraints.
+        let circuit_digest_parts = [
+            constants_sigmas_cap.flatten(),
+            domain_separator_digest.to_vec(),
+            vec![
+                F::from_canonical_usize(degree_bits),
+                /* Add other circuit data here */
+            ],
+        ];
+        let circuit_digest = C::Hasher::hash_no_pad(&circuit_digest_parts.concat());
+        let common = CommonCircuitData {
+            config: self.config,
+            fri_params,
+            gates,
+            selectors_info,
+            quotient_degree_factor,
+            num_gate_constraints,
+            num_constants,
+            num_public_inputs,
+            k_is,
+            num_partial_products,
+            num_lookup_polys,
+            num_lookup_selectors,
+            luts: self.luts,
+        };
+        if let Some(goal_data) = self.goal_common_data {
+            assert_eq!(goal_data, common, "The expected circuit data passed to cyclic recursion method did not match the actual circuit");
+        }
+
+        let prover_only = ProverOnlyCircuitData {
+            generators: self.generators,
+            generator_indices_by_watches,
+            constants_sigmas_commitment,
+            sigmas: transpose_poly_values(sigma_vecs),
+            subgroup,
+            public_inputs: self.public_inputs,
+            representative_map: forest.parents,
+            fft_root_table: Some(fft_root_table_max),
+            circuit_digest,
+            lookup_rows: self.lookup_rows.clone(),
+            lut_to_lookups: self.lut_to_lookups.clone(),
+        };
+
+        let verifier_only = VerifierOnlyCircuitData {
+            constants_sigmas_cap,
+            circuit_digest,
+        };
+
+        timing.print();
+        #[cfg(feature = "std")]
+        debug!("Building circuit took {}s", start.elapsed().as_secs_f32());
+        CircuitData {
+            prover_only,
+            verifier_only,
+            common,
+        }
     }
 }

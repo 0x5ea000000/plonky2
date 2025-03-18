@@ -1,3 +1,5 @@
+#![feature(inherent_associated_types)]
+#![feature(allocator_api)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 #![deny(rustdoc::broken_intra_doc_links)]

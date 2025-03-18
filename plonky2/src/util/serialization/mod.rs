@@ -335,6 +335,11 @@ pub trait Read {
             leaves,
             digests,
             cap,
+            my_leaf_len: todo!(),
+            my_leaves: todo!(),
+            my_leaves_len: todo!(),
+            my_leaves_dev_offset: todo!(),
+            my_digests: todo!(),
         })
     }
 
