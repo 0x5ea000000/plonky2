@@ -395,6 +395,17 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn my_full_witness(self) -> MatrixWitness<F> {
+        // TODO: remove this block
+        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
+        for i in 0..self.degree {
+            for j in 0..self.num_wires {
+                let t = Target::Wire(Wire { row: i, column: j });
+                if let Some(x) = self.try_get_target(t) {
+                    wire_values[j][i] = x;
+                }
+            }
+        }
+
         let mut my_wire_values = vec![F::ZERO; self.degree * self.num_wires];
         my_wire_values.par_chunks_mut(self.degree).enumerate().for_each(|(j, values)| {
             for i in 0..self.degree {
@@ -404,7 +415,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                 }
             }
         });
-        MatrixWitness {  wire_values: vec![], my_wire_values, degree: self.degree }
+        MatrixWitness {  wire_values, my_wire_values, degree: self.degree }
     }
 }
 
